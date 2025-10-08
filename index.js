@@ -36,35 +36,48 @@ client.on('error', (err) => console.error('MQTT error:', err));
 client.on('message', async (topic, payload) => {
   let msg;
   try { msg = JSON.parse(payload.toString()); }
-  catch { console.warn('Skipping non-JSON:', topic, payload.toString()); return; }
+  catch { console.warn('Skipping non-JSON:', topic); return; }
 
-  const device_id   = msg.device_id || guessDeviceIdFromTopic(topic);
-  const moisture    = num(msg.moisture);
-  const temperature = num(msg.temp ?? msg.temperature);
-  const fertility   = num(msg.fertility ?? msg.conductivity ?? msg.ec ?? msg.ec_uScm);
-  const battery     = (msg.battery === undefined) ? null : intNum(msg.battery); // optional
+  // Extract device_id from message or topic
+  const device_id =
+    msg.device_id ||
+    msg.id ||
+    guessDeviceIdFromTopic(topic); // will pull “C47C8D6D672B” from your topic
 
-  if (!device_id) { console.warn('No device_id (msg or topic). Skipping.', { topic }); return; }
+  // Map Theengs fields → our database columns
+  const moisture    = num(msg.moisture ?? msg.moi);
+  const temperature = num(msg.temp ?? msg.tempc);
+  const fertility   = num(msg.fertility ?? msg.fer);
+  const light_lux   = num(msg.light_lux ?? msg.lux);
+  const battery     = (msg.battery === undefined) ? null : intNum(msg.battery);
+
+  if (!device_id) { console.warn('No device_id → skipping', { topic }); return; }
 
   try {
-    // Find sensor by device_id
     const { data: sensor, error: sensorErr } = await supabase
       .from('sensors')
       .select('id')
       .eq('device_id', device_id)
       .maybeSingle();
-    if (sensorErr) throw sensorErr;
-    if (!sensor) { console.warn(`Unknown device_id "${device_id}"`); return; }
 
-    const row = { sensor_id: sensor.id, moisture, temperature, fertility, battery, raw: msg };
+    let sensor_id;
+    if (!sensorErr && sensor) {
+      sensor_id = sensor.id;
+    } else {
+      console.warn(`Unknown device_id "${device_id}" – add to Supabase.sensors first`);
+      return; // stop here until you register it
+    }
+
+    const row = { sensor_id, moisture, temperature, fertility, light_lux, battery, raw: msg };
     const { error: insertErr } = await supabase.from('readings').insert(row);
     if (insertErr) throw insertErr;
 
-    console.log('Inserted reading:', { device_id, moisture, temperature, fertility, battery });
+    console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery });
   } catch (e) {
     console.error('Ingestion error:', e);
   }
 });
+
 
 function guessDeviceIdFromTopic(topic) {
   // silodam/plants/plant01/telemetry → "plant01"
