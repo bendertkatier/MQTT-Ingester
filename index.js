@@ -33,16 +33,22 @@ client.on('connect', () => {
 
 client.on('error', (err) => console.error('MQTT error:', err));
 
+function normalizeId(id) {
+  if (!id) return null;
+  const hex = id.toUpperCase().replace(/[^0-9A-F]/g, '');
+  if (hex.length !== 12) return id;
+  return hex.match(/.{2}/g).join(':');
+}
+
 client.on('message', async (topic, payload) => {
   let msg;
   try { msg = JSON.parse(payload.toString()); }
   catch { console.warn('Skipping non-JSON:', topic); return; }
 
-  // Extract device_id from message or topic
-  const device_id =
-    msg.device_id ||
-    msg.id ||
-    guessDeviceIdFromTopic(topic); // will pull “C47C8D6D672B” from your topic
+   // Extract and normalize device_id (handles both topic + colon formats)
+  const raw_id = msg.device_id || msg.id || guessDeviceIdFromTopic(topic);
+  const device_id = normalizeId(raw_id);
+
 
   // Map Theengs fields → our database columns
   const moisture    = num(msg.moisture ?? msg.moi);
