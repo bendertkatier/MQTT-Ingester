@@ -59,7 +59,8 @@ function isPlantSensor(msg, deviceIdHexNoColons) {
   // 1) Prefer explicit message hints
   if (msg?.type && String(msg.type).toUpperCase() === 'PLANT') return true;
   if (msg?.plant === true) return true;
-  if (msg?.model && /MiFlora|Flower\s*Care/i.test(String(msg.model))) return true;
+  if (msg?.model && /MiFlora|Flower\s*Care|Grow\s*care\s*garden/i.test(String(msg.model))) return true;
+  if (msg?.name && /Flower\s*care|Grow\s*care\s*garden/i.test(String(msg.name))) return true;
 
   // 2) Fallback: Xiaomi MiFlora family prefix only if message is inconclusive
   if (deviceIdHexNoColons?.startsWith('C47C8D6')) return true;
@@ -67,16 +68,36 @@ function isPlantSensor(msg, deviceIdHexNoColons) {
   return false;
 }
 
-function inferModel(msg, deviceIdHexNoColons) {
+// Model: prefer message; default to "MiFlora"
+function getModel(msg) {
   if (msg?.model) return String(msg.model);
-  const hex = (deviceIdHexNoColons || '').toUpperCase();
-  if (hex.startsWith('C47C8D6C')) return 'MiFlora';
-  if (hex.startsWith('C47C8D6D')) return 'Flower Care';
-  return 'Unknown';
+  return 'MiFlora';
 }
 
-function extractBrand(msg) {
+// Brand: prefer message; else null
+function getBrand(msg) {
   return msg?.brand ? String(msg.brand) : null;
+}
+
+// Hardware name as broadcast by device ("Flower care" / "Grow care garden")
+function getHwName(msg) {
+  return msg?.name ? String(msg.name) : null;
+}
+
+// Probe type normalized from name, with MAC prefix fallback:
+//   "Flower care" -> "shallow"
+//   "Grow care garden" -> "deep"
+//   C47C8D6C* -> shallow, C47C8D6D* -> deep
+function getProbeType(msg, deviceIdHexNoColons) {
+  const name = (msg?.name || '').toLowerCase();
+  if (name.includes('flower care')) return 'shallow';
+  if (name.includes('grow care garden')) return 'deep';
+
+  const hex = (deviceIdHexNoColons || '').toUpperCase();
+  if (hex.startsWith('C47C8D6C')) return 'shallow';
+  if (hex.startsWith('C47C8D6D')) return 'deep';
+
+  return null; // unknown / not set
 }
 
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
@@ -110,9 +131,11 @@ client.on('message', async (topic, payload) => {
   const light_lux   = num(msg.light_lux ?? msg.lux);
   const battery     = (msg.battery === undefined) ? null : intNum(msg.battery);
 
-  // Model/brand from message (preferred), else infer
-  const model = inferModel(msg, deviceHex);
-  const brand = extractBrand(msg);
+  // Metadata from message (preferred), else fallback
+  const model     = getModel(msg);                    // keep as MiFlora unless message says otherwise
+  const brand     = getBrand(msg);                    // e.g. "Xiaomi/VegTrug"
+  const hw_name   = getHwName(msg);                   // "Flower care" / "Grow care garden"
+  const probe_type = getProbeType(msg, deviceHex);    // "shallow" / "deep" / null
 
   if (!device_id) {
     console.warn('No device_id → skipping', { topic });
@@ -123,7 +146,7 @@ client.on('message', async (topic, payload) => {
     // Find (or auto-register) sensor by device_id
     const { data: sensor, error: sensorErr } = await supabase
       .from('sensors')
-      .select('id, model, brand')
+      .select('id, model, brand, hw_name, probe_type')
       .eq('device_id', device_id)
       .maybeSingle();
 
@@ -131,13 +154,14 @@ client.on('message', async (topic, payload) => {
     if (!sensorErr && sensor) {
       sensor_id = sensor.id;
 
-      // Backfill model/brand if missing/unknown and we now know better
-      const needModel = model && model !== 'Unknown' && model !== sensor.model;
-      const needBrand = brand && brand !== sensor.brand;
-      if (needModel || needBrand) {
-        const patch = {};
-        if (needModel) patch.model = model;
-        if (needBrand) patch.brand = brand;
+      // Update metadata if we have better/different info now
+      const patch = {};
+      if (model && model !== sensor.model) patch.model = model;
+      if (brand && brand !== sensor.brand) patch.brand = brand;
+      if (hw_name && hw_name !== sensor.hw_name) patch.hw_name = hw_name;
+      if (probe_type && probe_type !== sensor.probe_type) patch.probe_type = probe_type;
+
+      if (Object.keys(patch).length) {
         await supabase.from('sensors').update(patch).eq('id', sensor_id);
       }
 
@@ -150,13 +174,15 @@ client.on('message', async (topic, payload) => {
           device_id,
           model,
           brand,
+          hw_name,
+          probe_type,  // "shallow" / "deep" if we could infer
           notes: 'Auto-registered by worker'
         })
         .select('id')
         .single();
       if (insErr) throw insErr;
       sensor_id = ins.id;
-      console.log(`Auto-registered sensor ${device_id} → plant ${DEFAULT_PLANT_ID} (model=${model}${brand ? `, brand=${brand}` : ''})`);
+      console.log(`Auto-registered sensor ${device_id} → plant ${DEFAULT_PLANT_ID} (model=${model}${brand ? `, brand=${brand}` : ''}${hw_name ? `, name=${hw_name}` : ''}${probe_type ? `, type=${probe_type}` : ''})`);
     } else {
       console.warn(`Unknown device_id "${device_id}" – skipped (no DEFAULT_PLANT_ID).`);
       return;
@@ -167,7 +193,7 @@ client.on('message', async (topic, payload) => {
     const { error: insertErr } = await supabase.from('readings').insert(row);
     if (insertErr) throw insertErr;
 
-    console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery, model, brand });
+    console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery, model, brand, hw_name, probe_type });
   } catch (e) {
     console.error('Ingestion error:', e);
   }
