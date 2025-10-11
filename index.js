@@ -130,12 +130,13 @@ client.on('message', async (topic, payload) => {
   const fertility   = num(msg.fertility ?? msg.fer);
   const light_lux   = num(msg.light_lux ?? msg.lux);
   const battery     = (msg.battery === undefined) ? null : intNum(msg.battery);
+  const rssi        = (msg.rssi === undefined) ? null : intNum(msg.rssi);
 
   // Metadata from message (preferred), else fallback
-  const model     = getModel(msg);                    // keep as MiFlora unless message says otherwise
-  const brand     = getBrand(msg);                    // e.g. "Xiaomi/VegTrug"
-  const hw_name   = getHwName(msg);                   // "Flower care" / "Grow care garden"
-  const probe_type = getProbeType(msg, deviceHex);    // "shallow" / "deep" / null
+  const model       = getModel(msg);                 // keep as MiFlora unless message says otherwise
+  const brand       = getBrand(msg);                 // e.g. "Xiaomi/VegTrug"
+  const hw_name     = getHwName(msg);                // "Flower care" / "Grow care garden"
+  const probe_type  = getProbeType(msg, deviceHex);  // "shallow" / "deep" / null
 
   if (!device_id) {
     console.warn('No device_id → skipping', { topic });
@@ -188,12 +189,12 @@ client.on('message', async (topic, payload) => {
       return;
     }
 
-    // Insert the reading
-    const row = { sensor_id, moisture, temperature, fertility, light_lux, battery, raw: msg };
+    // Insert the reading (now with RSSI)
+    const row = { sensor_id, moisture, temperature, fertility, light_lux, battery, rssi, raw: msg };
     const { error: insertErr } = await supabase.from('readings').insert(row);
     if (insertErr) throw insertErr;
 
-    console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery, model, brand, hw_name, probe_type });
+    console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery, rssi, model, brand, hw_name, probe_type });
   } catch (e) {
     console.error('Ingestion error:', e);
   }
