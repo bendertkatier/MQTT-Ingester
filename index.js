@@ -144,16 +144,19 @@ client.on('message', async (topic, payload) => {
   }
 
   try {
-    // Find (or auto-register) sensor by device_id
+    // Find (or auto-register) sensor by device_id (also fetch plant_id for snapshot)
     const { data: sensor, error: sensorErr } = await supabase
       .from('sensors')
-      .select('id, model, brand, hw_name, probe_type')
+      .select('id, plant_id, model, brand, hw_name, probe_type')
       .eq('device_id', device_id)
       .maybeSingle();
 
     let sensor_id;
+    let currentPlantId;
+
     if (!sensorErr && sensor) {
       sensor_id = sensor.id;
+      currentPlantId = sensor.plant_id;
 
       // Update metadata if we have better/different info now
       const patch = {};
@@ -179,22 +182,34 @@ client.on('message', async (topic, payload) => {
           probe_type,  // "shallow" / "deep" if we could infer
           notes: 'Auto-registered by worker'
         })
-        .select('id')
+        .select('id, plant_id')
         .single();
       if (insErr) throw insErr;
       sensor_id = ins.id;
+      currentPlantId = ins.plant_id;
       console.log(`Auto-registered sensor ${device_id} → plant ${DEFAULT_PLANT_ID} (model=${model}${brand ? `, brand=${brand}` : ''}${hw_name ? `, name=${hw_name}` : ''}${probe_type ? `, type=${probe_type}` : ''})`);
     } else {
       console.warn(`Unknown device_id "${device_id}" – skipped (no DEFAULT_PLANT_ID).`);
       return;
     }
 
-    // Insert the reading (now with RSSI)
-    const row = { sensor_id, moisture, temperature, fertility, light_lux, battery, rssi, raw: msg };
+    // Snapshot the plant at insert time (so history sticks with the plant even if sensor moves later)
+    const row = {
+      sensor_id,
+      plant_id: currentPlantId ?? DEFAULT_PLANT_ID ?? null,
+      moisture,
+      temperature,
+      fertility,
+      light_lux,
+      battery,
+      rssi,
+      raw: msg
+    };
+
     const { error: insertErr } = await supabase.from('readings').insert(row);
     if (insertErr) throw insertErr;
 
-    console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery, rssi, model, brand, hw_name, probe_type });
+    console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery, rssi, model, brand, hw_name, probe_type, plant_id: row.plant_id });
   } catch (e) {
     console.error('Ingestion error:', e);
   }
