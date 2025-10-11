@@ -59,30 +59,45 @@ client.on('message', async (topic, payload) => {
 
   if (!device_id) { console.warn('No device_id → skipping', { topic }); return; }
 
-  try {
-    const { data: sensor, error: sensorErr } = await supabase
+try {
+  // Find (or auto-register) sensor by device_id
+  const { data: sensor, error: sensorErr } = await supabase
+    .from('sensors')
+    .select('id')
+    .eq('device_id', device_id)
+    .maybeSingle();
+
+  let sensor_id;
+  if (!sensorErr && sensor) {
+    sensor_id = sensor.id;
+  } else if (process.env.DEFAULT_PLANT_ID) {
+    // Auto-register unknown sensor into Quarantine
+    const { data: ins, error: insErr } = await supabase
       .from('sensors')
+      .insert({
+        plant_id: process.env.DEFAULT_PLANT_ID,
+        device_id,
+        model: msg.model ?? 'MiFlora',
+        notes: 'Auto-registered by worker'
+      })
       .select('id')
-      .eq('device_id', device_id)
-      .maybeSingle();
-
-    let sensor_id;
-    if (!sensorErr && sensor) {
-      sensor_id = sensor.id;
-    } else {
-      console.warn(`Unknown device_id "${device_id}" – add to Supabase.sensors first`);
-      return; // stop here until you register it
-    }
-
-    const row = { sensor_id, moisture, temperature, fertility, light_lux, battery, raw: msg };
-    const { error: insertErr } = await supabase.from('readings').insert(row);
-    if (insertErr) throw insertErr;
-
-    console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery });
-  } catch (e) {
-    console.error('Ingestion error:', e);
+      .single();
+    if (insErr) throw insErr;
+    sensor_id = ins.id;
+    console.log(`Auto-registered sensor ${device_id} → plant ${process.env.DEFAULT_PLANT_ID}`);
+  } else {
+    console.warn(`Unknown device_id "${device_id}" – add to Supabase.sensors or set DEFAULT_PLANT_ID`);
+    return;
   }
-});
+
+  const row = { sensor_id, moisture, temperature, fertility, light_lux, battery, raw: msg };
+  const { error: insertErr } = await supabase.from('readings').insert(row);
+  if (insertErr) throw insertErr;
+
+  console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery });
+} catch (e) {
+  console.error('Ingestion error:', e);
+}
 
 
 function guessDeviceIdFromTopic(topic) {
