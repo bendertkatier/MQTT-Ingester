@@ -36,7 +36,8 @@ client.on('connect', () => {
 
 client.on('error', (err) => console.error('MQTT error:', err));
 
-/** Helpers **/
+/* ---------- Helpers ---------- */
+
 function guessDeviceIdFromTopic(topic) {
   // e.g. "home/Theengs/BTtoMQTT/C47C8D6D672B" -> "C47C8D6D672B"
   const parts = (topic || '').split('/').filter(Boolean);
@@ -46,14 +47,43 @@ function guessDeviceIdFromTopic(topic) {
 function normalizeId(id) {
   if (!id) return null;
   const hex = id.toUpperCase().replace(/[^0-9A-F]/g, '');
-  if (hex.length !== 12) return id;           // keep as-is if not a 12-hex MiFlora MAC
-  return hex.match(/.{2}/g).join(':');        // "C4:7C:8D:6D:67:2B"
+  if (hex.length !== 12) return id;     // keep as-is if not a 12-hex MiFlora MAC
+  return hex.match(/.{2}/g).join(':');  // "C4:7C:8D:6D:67:2B"
 }
 
-function num(v){ const n = Number(v); return Number.isFinite(n) ? n : null; }
-function intNum(v){ const n = parseInt(v,10); return Number.isFinite(n) ? n : null; }
+function hexNoColons(id) {
+  return (id || '').toUpperCase().replace(/[^0-9A-F]/g, '');
+}
 
-/** Message handler **/
+function isPlantSensor(msg, deviceIdHexNoColons) {
+  // 1) Prefer explicit message hints
+  if (msg?.type && String(msg.type).toUpperCase() === 'PLANT') return true;
+  if (msg?.plant === true) return true;
+  if (msg?.model && /MiFlora|Flower\s*Care/i.test(String(msg.model))) return true;
+
+  // 2) Fallback: Xiaomi MiFlora family prefix only if message is inconclusive
+  if (deviceIdHexNoColons?.startsWith('C47C8D6')) return true;
+
+  return false;
+}
+
+function inferModel(msg, deviceIdHexNoColons) {
+  if (msg?.model) return String(msg.model);
+  const hex = (deviceIdHexNoColons || '').toUpperCase();
+  if (hex.startsWith('C47C8D6C')) return 'MiFlora';
+  if (hex.startsWith('C47C8D6D')) return 'Flower Care';
+  return 'Unknown';
+}
+
+function extractBrand(msg) {
+  return msg?.brand ? String(msg.brand) : null;
+}
+
+function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
+function intNum(v) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; }
+
+/* ---------- Message handler ---------- */
+
 client.on('message', async (topic, payload) => {
   let msg;
   try {
@@ -63,16 +93,26 @@ client.on('message', async (topic, payload) => {
     return;
   }
 
-  // Extract and normalize device_id (handles both topic + colon formats)
+  // Device ID (topic or payload), normalized to colon format
   const raw_id = msg.device_id || msg.id || guessDeviceIdFromTopic(topic);
   const device_id = normalizeId(raw_id);
+  const deviceHex = hexNoColons(device_id);
 
-  // Map Theengs fields → our database columns
+  // Only ingest plant sensors (data-driven first, Xiaomi prefix as fallback)
+  if (!isPlantSensor(msg, deviceHex)) {
+    return; // ignore non-plant devices cleanly
+  }
+
+  // Map fields
   const moisture    = num(msg.moisture ?? msg.moi);
   const temperature = num(msg.temp ?? msg.tempc);
   const fertility   = num(msg.fertility ?? msg.fer);
   const light_lux   = num(msg.light_lux ?? msg.lux);
   const battery     = (msg.battery === undefined) ? null : intNum(msg.battery);
+
+  // Model/brand from message (preferred), else infer
+  const model = inferModel(msg, deviceHex);
+  const brand = extractBrand(msg);
 
   if (!device_id) {
     console.warn('No device_id → skipping', { topic });
@@ -83,38 +123,51 @@ client.on('message', async (topic, payload) => {
     // Find (or auto-register) sensor by device_id
     const { data: sensor, error: sensorErr } = await supabase
       .from('sensors')
-      .select('id')
+      .select('id, model, brand')
       .eq('device_id', device_id)
       .maybeSingle();
 
     let sensor_id;
     if (!sensorErr && sensor) {
       sensor_id = sensor.id;
+
+      // Backfill model/brand if missing/unknown and we now know better
+      const needModel = (!sensor.model || sensor.model === 'Unknown') && model && model !== 'Unknown';
+      const needBrand = (!sensor.brand && brand);
+      if (needModel || needBrand) {
+        const patch = {};
+        if (needModel) patch.model = model;
+        if (needBrand) patch.brand = brand;
+        await supabase.from('sensors').update(patch).eq('id', sensor_id);
+      }
+
     } else if (DEFAULT_PLANT_ID) {
-      // Auto-register unknown sensor into Quarantine
+      // Auto-register unknown sensor into Quarantine with best-known metadata
       const { data: ins, error: insErr } = await supabase
         .from('sensors')
         .insert({
           plant_id: DEFAULT_PLANT_ID,
           device_id,
-          model: msg.model ?? 'MiFlora',
+          model,
+          brand,
           notes: 'Auto-registered by worker'
         })
         .select('id')
         .single();
       if (insErr) throw insErr;
       sensor_id = ins.id;
-      console.log(`Auto-registered sensor ${device_id} → plant ${DEFAULT_PLANT_ID}`);
+      console.log(`Auto-registered sensor ${device_id} → plant ${DEFAULT_PLANT_ID} (model=${model}${brand ? `, brand=${brand}` : ''})`);
     } else {
-      console.warn(`Unknown device_id "${device_id}" – add to Supabase.sensors or set DEFAULT_PLANT_ID`);
+      console.warn(`Unknown device_id "${device_id}" – skipped (no DEFAULT_PLANT_ID).`);
       return;
     }
 
+    // Insert the reading
     const row = { sensor_id, moisture, temperature, fertility, light_lux, battery, raw: msg };
     const { error: insertErr } = await supabase.from('readings').insert(row);
     if (insertErr) throw insertErr;
 
-    console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery });
+    console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery, model, brand });
   } catch (e) {
     console.error('Ingestion error:', e);
   }
