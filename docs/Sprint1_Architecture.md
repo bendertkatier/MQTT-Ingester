@@ -1,7 +1,7 @@
 # 🌿 Sprint 1 — Foundation & Hardware
 
 ## 🎯 Objective
-Get one working sensor reliably pushing data to MQTT.  
+Get all my plant sensor reliably pushing data to MQTT.  
 Goal: live plant telemetry published to a broker and verified.
 
 ---
