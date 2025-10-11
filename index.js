@@ -7,13 +7,16 @@ const {
   MQTT_PASSWORD,
   MQTT_TOPIC_BASE,
   SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE
+  SUPABASE_SERVICE_ROLE,
+  DEFAULT_PLANT_ID
 } = process.env;
 
 if (!MQTT_URL || !MQTT_TOPIC_BASE || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
   console.error('Missing env vars: MQTT_URL, MQTT_TOPIC_BASE, SUPABASE_URL, SUPABASE_SERVICE_ROLE');
   process.exit(1);
 }
+
+console.log('DEFAULT_PLANT_ID:', DEFAULT_PLANT_ID ? 'set' : 'NOT set');
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   auth: { persistSession: false, autoRefreshToken: false }
@@ -33,22 +36,36 @@ client.on('connect', () => {
 
 client.on('error', (err) => console.error('MQTT error:', err));
 
+/** Helpers **/
+function guessDeviceIdFromTopic(topic) {
+  // e.g. "home/Theengs/BTtoMQTT/C47C8D6D672B" -> "C47C8D6D672B"
+  const parts = (topic || '').split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : null;
+}
+
 function normalizeId(id) {
   if (!id) return null;
   const hex = id.toUpperCase().replace(/[^0-9A-F]/g, '');
-  if (hex.length !== 12) return id;
-  return hex.match(/.{2}/g).join(':');
+  if (hex.length !== 12) return id;           // keep as-is if not a 12-hex MiFlora MAC
+  return hex.match(/.{2}/g).join(':');        // "C4:7C:8D:6D:67:2B"
 }
 
+function num(v){ const n = Number(v); return Number.isFinite(n) ? n : null; }
+function intNum(v){ const n = parseInt(v,10); return Number.isFinite(n) ? n : null; }
+
+/** Message handler **/
 client.on('message', async (topic, payload) => {
   let msg;
-  try { msg = JSON.parse(payload.toString()); }
-  catch { console.warn('Skipping non-JSON:', topic); return; }
+  try {
+    msg = JSON.parse(payload.toString());
+  } catch {
+    console.warn('Skipping non-JSON:', topic);
+    return;
+  }
 
-   // Extract and normalize device_id (handles both topic + colon formats)
+  // Extract and normalize device_id (handles both topic + colon formats)
   const raw_id = msg.device_id || msg.id || guessDeviceIdFromTopic(topic);
   const device_id = normalizeId(raw_id);
-
 
   // Map Theengs fields → our database columns
   const moisture    = num(msg.moisture ?? msg.moi);
@@ -57,53 +74,48 @@ client.on('message', async (topic, payload) => {
   const light_lux   = num(msg.light_lux ?? msg.lux);
   const battery     = (msg.battery === undefined) ? null : intNum(msg.battery);
 
-  if (!device_id) { console.warn('No device_id → skipping', { topic }); return; }
-
-try {
-  // Find (or auto-register) sensor by device_id
-  const { data: sensor, error: sensorErr } = await supabase
-    .from('sensors')
-    .select('id')
-    .eq('device_id', device_id)
-    .maybeSingle();
-
-  let sensor_id;
-  if (!sensorErr && sensor) {
-    sensor_id = sensor.id;
-  } else if (process.env.DEFAULT_PLANT_ID) {
-    // Auto-register unknown sensor into Quarantine
-    const { data: ins, error: insErr } = await supabase
-      .from('sensors')
-      .insert({
-        plant_id: process.env.DEFAULT_PLANT_ID,
-        device_id,
-        model: msg.model ?? 'MiFlora',
-        notes: 'Auto-registered by worker'
-      })
-      .select('id')
-      .single();
-    if (insErr) throw insErr;
-    sensor_id = ins.id;
-    console.log(`Auto-registered sensor ${device_id} → plant ${process.env.DEFAULT_PLANT_ID}`);
-  } else {
-    console.warn(`Unknown device_id "${device_id}" – add to Supabase.sensors or set DEFAULT_PLANT_ID`);
+  if (!device_id) {
+    console.warn('No device_id → skipping', { topic });
     return;
   }
 
-  const row = { sensor_id, moisture, temperature, fertility, light_lux, battery, raw: msg };
-  const { error: insertErr } = await supabase.from('readings').insert(row);
-  if (insertErr) throw insertErr;
+  try {
+    // Find (or auto-register) sensor by device_id
+    const { data: sensor, error: sensorErr } = await supabase
+      .from('sensors')
+      .select('id')
+      .eq('device_id', device_id)
+      .maybeSingle();
 
-  console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery });
-} catch (e) {
-  console.error('Ingestion error:', e);
-}
+    let sensor_id;
+    if (!sensorErr && sensor) {
+      sensor_id = sensor.id;
+    } else if (DEFAULT_PLANT_ID) {
+      // Auto-register unknown sensor into Quarantine
+      const { data: ins, error: insErr } = await supabase
+        .from('sensors')
+        .insert({
+          plant_id: DEFAULT_PLANT_ID,
+          device_id,
+          model: msg.model ?? 'MiFlora',
+          notes: 'Auto-registered by worker'
+        })
+        .select('id')
+        .single();
+      if (insErr) throw insErr;
+      sensor_id = ins.id;
+      console.log(`Auto-registered sensor ${device_id} → plant ${DEFAULT_PLANT_ID}`);
+    } else {
+      console.warn(`Unknown device_id "${device_id}" – add to Supabase.sensors or set DEFAULT_PLANT_ID`);
+      return;
+    }
 
+    const row = { sensor_id, moisture, temperature, fertility, light_lux, battery, raw: msg };
+    const { error: insertErr } = await supabase.from('readings').insert(row);
+    if (insertErr) throw insertErr;
 
-function guessDeviceIdFromTopic(topic) {
-  // silodam/plants/plant01/telemetry → "plant01"
-  const parts = topic.split('/');
-  return parts.length >= 4 ? parts[2] : null;
-}
-function num(v){ const n = Number(v); return Number.isFinite(n) ? n : null; }
-function intNum(v){ const n = parseInt(v,10); return Number.isFinite(n) ? n : null; }
+    console.log('Inserted:', { device_id, moisture, temperature, fertility, light_lux, battery });
+  } catch (e) {
+    console.error('Ingestion error:', e);
+  }
+});
