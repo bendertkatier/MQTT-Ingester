@@ -10,6 +10,10 @@ const {
   SUPABASE_SERVICE_ROLE
 } = process.env;
 
+console.log('DEFAULT_PLANT_ID:', process.env.DEFAULT_PLANT_ID ? 'set' : 'NOT set');
+
+
+
 if (!MQTT_URL || !MQTT_TOPIC_BASE || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
   console.error('Missing env vars: MQTT_URL, MQTT_TOPIC_BASE, SUPABASE_URL, SUPABASE_SERVICE_ROLE');
   process.exit(1);
