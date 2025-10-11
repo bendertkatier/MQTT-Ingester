@@ -132,8 +132,8 @@ client.on('message', async (topic, payload) => {
       sensor_id = sensor.id;
 
       // Backfill model/brand if missing/unknown and we now know better
-      const needModel = (!sensor.model || sensor.model === 'Unknown') && model && model !== 'Unknown';
-      const needBrand = (!sensor.brand && brand);
+      const needModel = model && model !== 'Unknown' && model !== sensor.model;
+      const needBrand = brand && brand !== sensor.brand;
       if (needModel || needBrand) {
         const patch = {};
         if (needModel) patch.model = model;
